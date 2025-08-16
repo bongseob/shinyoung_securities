@@ -1,0 +1,358 @@
+/* extract_sql.pc : Java 소스에서 SQL 구문을 추출해 텍스트 파일로 저장
+   - 지원: "..." 문자열, "..." + "..." 연결, sb.append("..."), prepareStatement("..."),
+           Java text block """ ... """ (JDK 15+)
+   - 출력: 파일경로:라인번호  이후 한 줄에 SQL 1건
+
+   빌드:
+     proc iname=extract_sql.pc oname=extract_sql.c code=ansi
+     cc -O2 -o extract_sql extract_sql.c
+
+   작성: 채비서
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <sys/stat.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+  #include <windows.h>
+  #include <io.h>
+  #define PATH_SEP '\\'
+#else
+  #include <dirent.h>
+  #include <unistd.h>
+  #define PATH_SEP '/'
+#endif
+
+/* Pro*C 헤더 (DB 미사용이지만 컴파일 호환을 위해 포함만) */
+EXEC SQL INCLUDE sqlca;
+
+/* --------- 유틸: 동적 배열/문자열 --------- */
+
+typedef struct {
+    long start;     /* 파일 내 시작 오프셋 */
+    long end;       /* 파일 내 끝 오프셋(닫는 따옴표 직후) */
+    int  line;      /* 시작 라인(1-base) */
+    int  is_textblock; /* """ 텍스트 블록 여부 */
+    char *text;     /* 실제 문자열 내용(escape 해제/개행 포함) */
+} StrTok;
+
+typedef struct {
+    StrTok *data;
+    size_t len;
+    size_t cap;
+} TokVec;
+
+static void tv_init(TokVec *v){ v->data=NULL; v->len=0; v->cap=0; }
+static void tv_push(TokVec *v, StrTok t){
+    if(v->len==v->cap){ v->cap = v->cap? v->cap*2:64; v->data=(StrTok*)realloc(v->data, v->cap*sizeof(StrTok)); }
+    v->data[v->len++] = t;
+}
+static void tv_free(TokVec *v){
+    if(!v) return;
+    for(size_t i=0;i<v->len;i++) free(v->data[i].text);
+    free(v->data); v->data=NULL; v->len=v->cap=0;
+}
+
+static char* xstrdup(const char* s){ size_t n=strlen(s); char* p=(char*)malloc(n+1); if(!p) exit(1); memcpy(p,s,n+1); return p; }
+
+/* 트리밍 + 스페이스 정규화 */
+static char* normalize_sql(const char* s){
+    size_t n=strlen(s);
+    char *out=(char*)malloc(n*2+1); /* 여유 */
+    size_t j=0; int prev_space=1;
+    for(size_t i=0;i<n;i++){
+        unsigned char c=(unsigned char)s[i];
+        if(c=='\r' || c=='\n' || c=='\t') c=' ';
+        if(isspace(c)){
+            if(!prev_space){ out[j++]=' '; prev_space=1; }
+        } else {
+            out[j++]= (char)c; prev_space=0;
+        }
+    }
+    /* 우측 트림 */
+    while(j>0 && out[j-1]==' ') j--;
+    out[j]=0;
+    /* 좌측 트림 */
+    size_t start=0; while(out[start]==' ') start++;
+    if(start>0) memmove(out, out+start, j-start+1);
+    return out;
+}
+
+/* 대소문자 무시 prefix 검사 */
+static int starts_with_sql_kw(const char* s){
+    if(!s) return 0;
+    while(*s && isspace((unsigned char)*s)) s++;
+    /* 주석/괄호 등 앞머리 무시 */
+    while(*s=='(' || *s=='/' || *s=='*') s++;
+    const char* kws[]={"SELECT","INSERT","UPDATE","DELETE","MERGE","CREATE","WITH", NULL};
+    for(int i=0;kws[i];i++){
+        size_t klen=strlen(kws[i]); int ok=1;
+        for(size_t j=0;j<klen;j++){
+            char c=s[j]; if(!c){ ok=0; break; }
+            if(toupper((unsigned char)c)!=kws[i][j]){ ok=0; break; }
+        }
+        if(ok) return 1;
+    }
+    return 0;
+}
+
+/* 파일 전체 로드 */
+static char* read_all(const char* path, long* out_len){
+    FILE* f=fopen(path,"rb"); if(!f) return NULL;
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    char* buf=(char*)malloc(n+1); if(!buf){ fclose(f); return NULL; }
+    if(fread(buf,1,n,f)!=(size_t)n){ fclose(f); free(buf); return NULL; }
+    buf[n]=0; fclose(f); if(out_len) *out_len=n; return buf;
+}
+
+/* 주석/문자/문자열/텍스트블록 토큰화: "..."와 """..."""만 수집 */
+static void tokenize_java_strings(const char* src, long n, TokVec* out){
+    int line=1;
+    for(long i=0;i<n;i++){
+        char c=src[i], c2=(i+1<n?src[i+1]:0), c3=(i+2<n?src[i+2]:0);
+
+        /* 라인 증가 */
+        if(c=='\n') { line++; continue; }
+
+        /* 라인 주석 // */
+        if(c=='/' && c2=='/'){
+            while(i<n && src[i]!='\n') i++;
+            if(i<n) line++;
+            continue;
+        }
+        /* 블록 주석 /* ... *\/ */
+        if(c=='/' && c2=='*'){
+            i+=2;
+            while(i+1<n){
+                if(src[i]=='\n') line++;
+                if(src[i]=='*' && src[i+1]=='/'){ i+=1; break; }
+                i++;
+            }
+            continue;
+        }
+        /* 문자 리터럴 */
+        if(c=='\''){
+            i++;
+            while(i<n){
+                if(src[i]=='\\'){ i+=2; }
+                else if(src[i]=='\''){ break; }
+                else { if(src[i]=='\n') line++; i++; }
+            }
+            continue;
+        }
+
+        /* 텍스트 블록 """ ... """ */
+        if(c=='\"' && c2=='\"' && c3=='\"'){
+            long start=i+3; int start_line=line;
+            i+=3;
+            while(i+2<n){
+                if(src[i]=='\n') line++;
+                if(src[i]=='\"' && src[i+1]=='\"' && src[i+2]=='\"'){
+                    long end=i; /* end 직전까지 내용 */
+                    /* 내용 복사 */
+                    long len=end-start;
+                    char* t=(char*)malloc(len+1);
+                    memcpy(t, src+start, len); t[len]=0;
+
+                    StrTok tok; tok.start=start; tok.end=i+3; tok.line=start_line; tok.is_textblock=1; tok.text=t;
+                    tv_push(out, tok);
+
+                    i+=2; /* 루프에서 +1 */
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+
+        /* 문자열 "..." (escape 고려) */
+        if(c=='\"'){
+            long start=i+1; int start_line=line;
+            i++;
+            while(i<n){
+                if(src[i]=='\n') line++;
+                if(src[i]=='\\'){ i+=2; continue; }
+                if(src[i]=='\"'){ break; }
+                i++;
+            }
+            long end=i;
+            /* unescape는 최소화(개행/탭만 스페이스로) */
+            long raw_len = end - start;
+            char* t=(char*)malloc(raw_len+1);
+            memcpy(t, src+start, raw_len); t[raw_len]=0;
+
+            StrTok tok; tok.start=start-1; tok.end=end+1; tok.line=start_line; tok.is_textblock=0; tok.text=t;
+            tv_push(out, tok);
+        }
+    }
+}
+
+/* 공백 스킵 */
+static long skip_ws(const char* s, long i, long n){
+    while(i<n){
+        char c=s[i];
+        if(c==' '||c=='\t'||c=='\r'||c=='\n') i++;
+        else break;
+    }
+    return i;
+}
+
+/* between이  +  이거나  ).append(  또는  .append(  패턴인지 검사 */
+static int link_via_concat_or_append(const char* s, long a_end, long b_start){
+    long i=a_end, n=(long)strlen(s);
+
+    i = skip_ws(s, i, n);
+    if(i<n && s[i]=='+') return 1;
+
+    /* ).append("  또는  .append("  근처 */
+    /* 뒤로 소폭 스캔 */
+    long j=a_end; int paren_close_seen=0;
+    for(int k=0;k<64 && j+k<n; k++){
+        char c=s[j+k];
+        if(c==')') paren_close_seen=1;
+        if(c=='.'){
+            /* ".append(" 패턴 확인 */
+            const char* p = s + j + k;
+            if(strncmp(p, ".append", 7)==0){
+                /* 다음 '(' 존재? */
+                const char* q = p+7;
+                while(*q && isspace((unsigned char)*q)) q++;
+                if(*q=='(') return 1;
+            }
+        }
+        if(c=='\"') break; /* 다음 문자열 리터럴 시작이 보이면 중단 */
+    }
+    return 0;
+}
+
+/* 토큰들을 이어붙여 하나의 SQL 후보 구성 */
+static char* build_combined(const char* src, TokVec* tv, size_t i0){
+    char* acc = xstrdup(tv->data[i0].text);
+    long last_end = tv->data[i0].end;
+    for(size_t i=i0+1;i<tv->len;i++){
+        /* 너무 멀면 중단(문맥 끊김 방지) */
+        if(tv->data[i].start - last_end > 1024) break;
+        if(link_via_concat_or_append(src, last_end, tv->data[i].start)==0) break;
+        /* 이어붙임 */
+        size_t L1=strlen(acc), L2=strlen(tv->data[i].text);
+        char* tmp=(char*)malloc(L1+L2+2);
+        memcpy(tmp, acc, L1); tmp[L1]=' '; memcpy(tmp+L1+1, tv->data[i].text, L2+1);
+        free(acc); acc=tmp;
+        last_end = tv->data[i].end;
+    }
+    return acc;
+}
+
+/* SQL인지 휴리스틱 판정 */
+static int looks_like_sql(const char* s){
+    char* norm = normalize_sql(s);
+    int ok = starts_with_sql_kw(norm);
+    free(norm);
+    return ok;
+}
+
+/* 결과 쓰기 */
+static void write_sql(FILE* out, const char* file, int line, const char* sql){
+    char* norm = normalize_sql(sql);
+    if(norm[0]){
+        fprintf(out, "%s:%d\t%s\n", file, line, norm);
+    }
+    free(norm);
+}
+
+/* 한 파일 처리 */
+static void process_file(const char* path, FILE* out){
+    long n=0; char* src = read_all(path, &n);
+    if(!src) return;
+
+    TokVec tv; tv_init(&tv);
+    tokenize_java_strings(src, n, &tv);
+
+    /* 중복 최소화용 간단 해시셋(아주 큰 프로젝트면 더 고급화 필요) */
+    typedef struct { unsigned long h; int line; } Seen;
+    Seen *seen=NULL; size_t s_len=0, s_cap=0;
+    #define H_INIT 1469598103934665603ULL
+    #define H_STEP(h,c) ((h ^ (unsigned long)(unsigned char)(c)) * 1099511628211ULL)
+
+    for(size_t i=0;i<tv.len;i++){
+        /* 후보 문자열 만들기(연결 포함) */
+        char* combined = build_combined(src, &tv, i);
+        if(looks_like_sql(combined)){
+            /* 해시 계산 */
+            unsigned long h=H_INIT; const char* p=combined; int cnt=0;
+            for(;*p;p++){ if(!isspace((unsigned char)*p)) { h=H_STEP(h, toupper((unsigned char)*p)); cnt++; } }
+            if(cnt>0){
+                int dup=0;
+                for(size_t k=0;k<s_len;k++){ if(seen[k].h==h){ dup=1; break; } }
+                if(!dup){
+                    if(s_len==s_cap){ s_cap = s_cap? s_cap*2:128; seen=(Seen*)realloc(seen, s_cap*sizeof(Seen)); }
+                    seen[s_len].h = h; seen[s_len].line = tv.data[i].line; s_len++;
+
+                    write_sql(out, path, tv.data[i].line, combined);
+                }
+            }
+        }
+        free(combined);
+    }
+
+    free(seen);
+    tv_free(&tv);
+    free(src);
+}
+
+/* 디렉토리 순회 */
+static void process_path(const char* path, FILE* out){
+    struct stat st;
+    if(stat(path, &st)!=0){ fprintf(stderr,"[warn] cannot stat: %s\n", path); return; }
+    if(S_ISREG(st.st_mode)){
+        /* .java 만 처리 */
+        const char* dot = strrchr(path, '.');
+        if(dot && (strcmp(dot, ".java")==0)) process_file(path, out);
+        return;
+    }
+#if defined(_WIN32) || defined(_WIN64)
+    /* 간단히: 재귀 미구현 — Windows는 WSL/MinGW 사용 권장 */
+    fprintf(stderr, "[info] 디렉토리 재귀는 POSIX dirent 기반입니다. WSL/MinGW 사용을 권장합니다.\n");
+#else
+    if(S_ISDIR(st.st_mode)){
+        DIR* d = opendir(path);
+        if(!d){ fprintf(stderr,"[warn] cannot open dir: %s\n", path); return; }
+        struct dirent* ent;
+        char buf[4096];
+        while((ent = readdir(d))){
+            if(strcmp(ent->d_name,".")==0 || strcmp(ent->d_name,"..")==0) continue;
+            snprintf(buf, sizeof(buf), "%s%c%s", path, PATH_SEP, ent->d_name);
+            if(stat(buf, &st)==0){
+                if(S_ISDIR(st.st_mode)) process_path(buf, out);
+                else {
+                    const char* dot = strrchr(buf, '.');
+                    if(dot && strcmp(dot, ".java")==0) process_file(buf, out);
+                }
+            }
+        }
+        closedir(d);
+    }
+#endif
+}
+
+/* 메인 */
+int main(int argc, char** argv){
+    if(argc<2){
+        fprintf(stderr,"사용법: %s <입력경로(파일/디렉토리)> [출력파일]\n", argv[0]);
+        return 1;
+    }
+    const char* inpath = argv[1];
+    const char* outpath = (argc>=3? argv[2] : "extracted_sql.txt");
+
+    FILE* out = fopen(outpath, "w");
+    if(!out){ fprintf(stderr,"출력 파일 생성 실패: %s\n", outpath); return 1; }
+
+    process_path(inpath, out);
+
+    fclose(out);
+    fprintf(stderr,"완료: %s 에 저장됨\n", outpath);
+    return 0;
+}
